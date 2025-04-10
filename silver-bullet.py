@@ -1,141 +1,140 @@
 import MetaTrader5 as mt5
 import pandas as pd
 import numpy as np
+from tradenotifier import send_email_notification
 import os
 from datetime import datetime, timedelta
 
-# Define the trading sessions for Silver Bullet in UTC
+# Define trading sessions in NY Time, convert to UTC (+5)
 SILVER_BULLET_SESSIONS = {
-    "London_Open": {"start": (3, 0), "end": (4, 0)},  # NY Time: 3AM - 4AM
-    "New_York_AM": {"start": (10, 0), "end": (11, 0)}, # NY Time: 10AM - 11AM
-    "New_York_PM": {"start": (14, 0), "end": (15, 0)}  # NY Time: 2PM - 3PM
+    "London_Open": {"start": (3, 0), "end": (4, 0)},    # 3AM–4AM NY
+    "New_York_AM": {"start": (10, 0), "end": (11, 0)},  # 10AM–11AM NY
+    "New_York_PM": {"start": (14, 0), "end": (15, 0)}   # 2PM–3PM NY
 }
 
-# Convert to UTC (assuming NY is UTC-5)
 def convert_to_utc(session):
-    start_utc = (session["start"][0] + 5, session["start"][1])
-    end_utc = (session["end"][0] + 5, session["end"][1])
-    return {"start": start_utc, "end": end_utc}
+    return {
+        "start": (session["start"][0] + 5, session["start"][1]),
+        "end": (session["end"][0] + 5, session["end"][1])
+    }
 
 SILVER_BULLET_SESSIONS_UTC = {key: convert_to_utc(val) for key, val in SILVER_BULLET_SESSIONS.items()}
-
-# Define the number of bars to fetch
 NUM_BARS = 100
-
-# get the passwords
 APP_PASSWORD = os.getenv("APP_PASSWORD")
+LOT_SIZE = 0.1
+DEVIATION = 10
 
+# === CONNECTION ===
 def conn():
-    # start the connection to MT5
-    resu = {
-        "Response": 200,
-        "Message": "Data from python"
-    }
-    # resu["server"]=server
-    valid_conn = mt5.initialize()
-    # check if the connection went through
-    if not (valid_conn):
-        resu["init_err"] = mt5.last_error()
-    # login into your account
+    if not mt5.initialize():
+        print("Initialization failed:", mt5.last_error())
+        return
+
     login = mt5.login(36610, APP_PASSWORD, "EGMSecurities-Demo")
     if not login:
-        resu["login_err"] = mt5.last_error()
-        print("the login was successful")
+        print("Login failed:", mt5.last_error())
+        return
 
-    else:
-        resu["Message"] = "Login is Successful"
-        print("the login was successful")
-        gatherDataController()
+    print("Login successful.")
+    gatherDataController()
 
+# === DATA GATHERING CONTROLLER ===
 def gatherDataController():
     print("Gathering data for Silver Bullet ICT strategy")
-    
-    # Define symbols and timeframes
-    SYMBOLS = ["EURUSD", "GBPUSD", "XAUUSD"]  # Example assets
-    TIMEFRAME = mt5.TIMEFRAME_M5  # 5-minute timeframe for ICT      
+    SYMBOLS = ["EURUSD", "GBPUSD", "XAUUSD"]
+    TIMEFRAME = mt5.TIMEFRAME_M5
 
     while True:
-        for pair in SYMBOLS:
-        # Get the current UTC time
-            now = datetime.utcnow()
-
-                # Check if the current time is within any of the Silver Bullet sessions
-            for session_name, session_times in SILVER_BULLET_SESSIONS_UTC.items():
-                start_hour, start_minute = session_times["start"]
-                end_hour, end_minute = session_times["end"]
-                
+        now = datetime.utcnow()
+        for symbol in SYMBOLS:
+            for session_name, times in SILVER_BULLET_SESSIONS_UTC.items():
+                start_hour, start_minute = times["start"]
+                end_hour, end_minute = times["end"]
                 session_start = now.replace(hour=start_hour, minute=start_minute, second=0, microsecond=0)
                 session_end = now.replace(hour=end_hour, minute=end_minute, second=0, microsecond=0)
 
                 if session_start <= now <= session_end:
-                    print(f"Currently within {session_name} session")
-                    
-                    # Fetch historical data
-                    backtest_data = mt5.copy_rates_from_pos(pair, TIMEFRAME, 1, NUM_BARS)
-                    if backtest_data is None or len(backtest_data) == 0:
-                        print(f"No data retrieved for {pair}")
+                    print(f"Within {session_name} session for {symbol}")
+
+                    data = mt5.copy_rates_from_pos(symbol, TIMEFRAME, 1, NUM_BARS)
+                    if data is None or len(data) == 0:
+                        print(f"No data for {symbol}")
                         continue
-                    
-                    bars = pd.DataFrame(backtest_data)
-                    bars["time"] = pd.to_datetime(bars["time"], unit="s")
 
-                    # Save data to CSV
-                    filename = f"backend/backtest/{pair}_{session_name}.csv"
-                    bars.to_csv(filename, index=False)
+                    df = pd.DataFrame(data)
+                    df["time"] = pd.to_datetime(df["time"], unit="s")
+                    os.makedirs("backend/backtest", exist_ok=True)
+                    df.to_csv(f"backend/backtest/{symbol}_{session_name}.csv", index=False)
 
-                    # Process for FVGs and Order Blocks
-                    generate_trade_signals(bars, pair, session_name)
+                    generate_trade_signals(df, symbol, session_name)
 
-    # Shutdown MT5 connection
-    mt5.shutdown()
-
+# === TECHNICAL DETECTORS ===
 def detect_fvg(df):
-    """
-    Detects Fair Value Gaps (FVG) in price action.
-    FVG occurs when there is an imbalance in price with a large gap between candle wicks.
-    """
-    df["FVG_Up"] = (df["low"].shift(2) > df["high"].shift(1))  # Bullish FVG
-    df["FVG_Down"] = (df["high"].shift(2) < df["low"].shift(1))  # Bearish FVG
+    df["FVG_Up"] = (df["low"].shift(2) > df["high"].shift(1))
+    df["FVG_Down"] = (df["high"].shift(2) < df["low"].shift(1))
     return df
 
 def detect_order_blocks(df):
-    """
-    Detects bullish and bearish Order Blocks (OB).
-    A bullish order block is a bearish candle before an uptrend.
-    A bearish order block is a bullish candle before a downtrend.
-    """
     df["Bullish_OB"] = (df["close"].shift(1) < df["open"].shift(1)) & (df["close"] > df["open"])
     df["Bearish_OB"] = (df["close"].shift(1) > df["open"].shift(1)) & (df["close"] < df["open"])
     return df
 
+# === TRADE ENTRY FUNCTION ===
+def place_order(symbol, direction, volume=LOT_SIZE):
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        print(f"No tick data for {symbol}")
+        return
+    
+    signal_message = f"trade execution for order type {order_type} at price {price}"
+    
+    send_email_notification(f"{symbol} ",signal_message)
+
+
+    order_type = mt5.ORDER_TYPE_BUY if direction == "buy" else mt5.ORDER_TYPE_SELL
+    price = tick.ask if direction == "buy" else tick.bid
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": volume,
+        "type": order_type,
+        "price": price,
+        "deviation": DEVIATION,
+        "magic": 777777,
+        "comment": f"SilverBullet_{direction.upper()}",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC
+    }
+
+    result = mt5.order_send(request)
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        print(f"Trade failed for {symbol}: {result.comment}")
+    else:
+        print(f"Trade executed: {direction.upper()} {symbol} at {price}")
+
+# === SIGNAL PROCESSOR ===
 def generate_trade_signals(df, symbol, session):
-    """
-    Generates buy/sell signals based on FVGs and Order Blocks.
-    """
     df = detect_fvg(df)
     df = detect_order_blocks(df)
 
-    # Buy Signal: When price taps into a bullish OB & Bullish FVG exists
-    df["Buy_Signal"] = (df["Bullish_OB"]) & (df["FVG_Up"])
+    df["Buy_Signal"] = df["Bullish_OB"] & df["FVG_Up"]
+    df["Sell_Signal"] = df["Bearish_OB"] & df["FVG_Down"]
 
-    # Sell Signal: When price taps into a bearish OB & Bearish FVG exists
-    df["Sell_Signal"] = (df["Bearish_OB"]) & (df["FVG_Down"])
-
-    # Filter for latest signal
-    latest_signal = df.iloc[-1]
-
-    if latest_signal["Buy_Signal"]:
-        print(f"BUY Signal detected on {symbol} in {session} session")
-    elif latest_signal["Sell_Signal"]:
-        print(f"SELL Signal detected on {symbol} in {session} session")
-
-    # Save signals to CSV
+    signal = df.iloc[-1]
+    os.makedirs("backend/signals", exist_ok=True)
     df.to_csv(f"backend/signals/{symbol}_{session}_signals.csv", index=False)
 
+    if signal["Buy_Signal"]:
+        print(f"✅ BUY Signal on {symbol} ({session})")
+        place_order(symbol, "buy")
+    elif signal["Sell_Signal"]:
+        print(f"✅ SELL Signal on {symbol} ({session})")
+        place_order(symbol, "sell")
 
+# === MAIN ===
 def main():
     conn()
-
 
 if __name__ == "__main__":
     main()

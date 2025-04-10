@@ -1,5 +1,6 @@
 from datetime import datetime, time as dtime
 import pandas as pd
+from tradenotifier import send_email_notification
 import MetaTrader5 as mt5
 import os
 
@@ -70,6 +71,10 @@ def log_signal(pair, direction, reason):
 def place_order(symbol, order_type="buy", volume=0.1):
     tick = mt5.symbol_info_tick(symbol)
     price = tick.ask if order_type == "buy" else tick.bid
+
+    signal_message = f"trade execution for order type {order_type} at price {price}"
+    
+    send_email_notification(f"{symbol} ",signal_message)
     order = mt5.order_send({
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
@@ -115,7 +120,7 @@ def execute_mtf_po3_smt_strategy():
             now = datetime.now()
             if not is_in_session(now):
                 print("Outside trading session")
-                return
+                continue
 
             for symbol in SYMBOLS:
                 # --- Fetch all TF data ---
