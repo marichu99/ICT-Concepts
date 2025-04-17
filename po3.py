@@ -40,6 +40,7 @@ def fetch_data(symbol, timeframe, bars):
 
 def is_in_session(current_time):
     now_time = current_time.time()
+    print(f"The sessions are {TRADING_SESSION_START} and {TRADING_SESSION_END}")
     return TRADING_SESSION_START <= now_time <= TRADING_SESSION_END
 
 def get_bias(df):
