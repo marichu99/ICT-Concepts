@@ -190,6 +190,8 @@ class TradingSimulator:
         
         total_trades = len(trades_df)
         win_rate = len(wins) / total_trades * 100 if total_trades > 0 else 0
+        total_profit = sum(wins['pnl'])
+        total_loss = sum(losses['pnl'])
         avg_win = wins['pnl'].mean() if not wins.empty else 0
         avg_loss = losses['pnl'].mean() if not losses.empty else 0
         profit_factor = abs(wins['pnl'].sum() / losses['pnl'].sum()) if not losses.empty else float('inf')
@@ -202,6 +204,8 @@ class TradingSimulator:
             "win_rate": win_rate,
             "avg_win": avg_win,
             "avg_loss": avg_loss,
+            "total_profit": total_profit,
+            "total_loss": total_loss,
             "profit_factor": profit_factor,
             "net_pnl": trades_df['pnl'].sum(),
             "max_drawdown": max_drawdown,
@@ -213,7 +217,7 @@ class TradingSimulator:
 
 if __name__ == "__main__":
     # Initialize simulator with M1 data for precision
-    simulator = TradingSimulator(symbol="XAUUSD", timeframe=mt5.TIMEFRAME_M1, days_back=30)
+    simulator = TradingSimulator(symbol="XAUUSD", timeframe=mt5.TIMEFRAME_M5, days_back=30)
     
     # Simulate trades with both FVG and liquidity sweep strategies
     trades_df = simulator.simulate_trades(use_fvg=True, use_sweeps=True, rr_ratio=2.0)
