@@ -5,11 +5,67 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 
 class TradingSimulator:
-    def __init__(self, symbol: str, timeframe: int, days_back: int = 150):
+    def __init__(self, symbol: str, timeframe: int, days_back: int = 150, account_balance: float = 10000, risk_per_trade: float = 0.01):
         self.symbol = symbol
         self.timeframe = timeframe
         self.days_back = days_back
+        self.account_balance = account_balance
+        self.risk_per_trade = risk_per_trade  # Risk 1% of account per trade
+        self.point_value = self._get_point_value()  # Value per pip/point for the symbol
         self.df = self._get_historical_data()
+        
+    def _get_point_value(self) -> float:
+        """Get the value per point for the symbol, including indices/futures."""
+        point_values = {
+            # Forex pairs
+            'EURUSD': 0.0001,
+            'GBPUSD': 0.0001,
+            'USDJPY': 0.01,
+            'AUDUSD': 0.0001,
+            'USDCAD': 0.0001,
+            # Metals
+            'XAUUSD': 0.01,  # Gold (1 pip = $0.01 per ounce)
+            'XAGUSD': 0.001, # Silver
+            # Indices (futures/CFDs) - typical values
+            'US500Roll': 0.1,    # SP500 (1 point = $0.1 per contract)
+            'US30': 0.1,     # Dow Jones
+            'UT100Roll': 0.1,   # NASDAQ100
+            'UT100': 0.1,    # Alternative NASDAQ100 symbol
+            'GER40': 0.1,    # DAX
+            'UK100': 0.1,    # FTSE
+        }
+        
+        # Check for known symbols
+        for sym in point_values:
+            if sym in self.symbol:
+                return point_values[sym]
+        
+        # Default for unknown symbols
+        if "JPY" in self.symbol:
+            return 0.01  # JPY pairs
+        return 0.0001    # Default for most forex
+        
+    def _calculate_lot_size(self, entry_price: float, stop_loss: float) -> float:
+        """
+        Calculate lot size based on account balance and risk percentage.
+        
+        Formula: Lots = (Account Balance * Risk %) / (Stop Loss in pips * Pip Value)
+        """
+        # Calculate stop loss distance in pips/points
+        if stop_loss < entry_price:  # Long trade
+            sl_pips = (entry_price - stop_loss) / self.point_value
+        else:  # Short trade
+            sl_pips = (stop_loss - entry_price) / self.point_value
+            
+        # Calculate dollar amount to risk
+        risk_amount = self.account_balance * self.risk_per_trade
+        
+        # Calculate lot size (standard lot = 100,000 units)
+        # For a standard lot, each pip is worth $10 for most pairs
+        lot_size = round(risk_amount / (sl_pips * self.point_value * 100000), 2)
+     
+        # Ensure lot size is within reasonable bounds
+        return max(0.01, min(lot_size, 50))  # Min 0.01 lot, max 50 lots
         
     def _get_historical_data(self) -> pd.DataFrame:
         """Fetch historical data from MT5."""
@@ -69,6 +125,7 @@ class TradingSimulator:
     def in_london_newyork_window(ts: pd.Timestamp) -> bool:
         """Check if time is in London/NY overlap or NY session."""
         hour = ts.hour
+        
         return (8 <= hour < 12) or (13 <= hour < 17)  # London/NY overlap + NY session
     
     def simulate_trades(self, use_fvg: bool = True, use_sweeps: bool = True, rr_ratio: float = 2.0) -> pd.DataFrame:
@@ -82,14 +139,16 @@ class TradingSimulator:
         if use_sweeps:
             sweep_signals = self.detect_liquidity_sweeps(self.df)
             trades += self._process_signals(sweep_signals, "SWEEP", rr_ratio)
-            
+        
+
+        pd.DataFrame(trades).sort_values('time').to_csv("SB.csv")
         return pd.DataFrame(trades).sort_values('time')
     
     def _process_signals(self, signals: List[Tuple[pd.Timestamp, str]], signal_type: str, rr_ratio: float) -> List[Dict]:
-        """Process trading signals and simulate trades."""
+        """Process trading signals and simulate trades with lot size calculation."""
         trades = []
         
-        for signal_time, signal_type in signals:
+        for signal_time, signal_dir in signals:
             if not self.in_london_newyork_window(signal_time):
                 continue
                 
@@ -106,54 +165,70 @@ class TradingSimulator:
             sl_distance = 0.2
             tp_distance = sl_distance * rr_ratio
             
-            if signal_type == "bullish":
+            if signal_dir == "bullish":
                 sl = entry_price - sl_distance
                 tp = entry_price + tp_distance
+                position_type = "buy"
             else:
                 sl = entry_price + sl_distance
                 tp = entry_price - tp_distance
+                position_type = "sell"
                 
+            # Calculate lot size based on risk
+            lot_size = self._calculate_lot_size(entry_price, sl)
+            
             # Check if price fills the entry zone (next 3 candles)
             future = self.df.iloc[entry_idx + 1:entry_idx + 4]
-            prices = future['low'] if signal_type == "bullish" else future['high']
+            prices = future['low'] if signal_dir == "bullish" else future['high']
             
-            if ((signal_type == "bullish" and prices.min() <= entry_price) or 
-                (signal_type == "bearish" and prices.max() >= entry_price)):
+            if ((signal_dir == "bullish" and prices.min() <= entry_price) or 
+                (signal_dir == "bearish" and prices.max() >= entry_price)):
                 
                 # Track trade outcome (12 candle duration max)
                 result = None
                 exit_time = None
                 exit_price = None
                 pnl = 0
+                pnl_pips = 0
                 
                 for i in range(entry_idx + 1, min(entry_idx + 12, len(self.df))):
                     current_candle = self.df.iloc[i]
                     high, low = current_candle['high'], current_candle['low']
                     
-                    if signal_type == "bullish":
+                    if signal_dir == "bullish":
                         if high >= tp:
                             result = "win"
                             exit_price = tp
-                            break
+                            pnl_pips = (tp - entry_price) / self.point_value
+                            #break
                         elif low <= sl:
                             result = "loss"
                             exit_price = sl
-                            break
+                            pnl_pips = (sl - entry_price) / self.point_value
+                            #break
                     else:
                         if low <= tp:
                             result = "win"
                             exit_price = tp
-                            break
+                            pnl_pips = (entry_price - tp) / self.point_value
+                            #break
                         elif high >= sl:
                             result = "loss"
                             exit_price = sl
-                            break
+                            pnl_pips = (entry_price - sl) / self.point_value
+                            #break
                 
                 if result:
-                    pnl = (exit_price - entry_price) * (1 if signal_type == "bullish" else -1)
+                    # Calculate monetary P&L
+                    pnl = pnl_pips * self.point_value * lot_size * 100000
+                    
+                    # Update account balance (compound or not, depending on your preference)
+                    # self.account_balance += pnl  # Uncomment for compounding
+                    
                     trades.append({
                         "time": signal_time,
-                        "type": f"{signal_type}_{signal_type}",
+                        "type": f"{signal_type}_{signal_dir}",
+                        "position": position_type,
                         "entry": entry_price,
                         "sl": sl,
                         "tp": tp,
@@ -162,7 +237,10 @@ class TradingSimulator:
                         "result": result,
                         "rr_ratio": rr_ratio,
                         "pnl": pnl,
-                        "atr": atr
+                        "pnl_pips": pnl_pips,
+                        "lot_size": lot_size,
+                        "atr": atr,
+                        "balance": self.account_balance + pnl  # Show what balance would be
                     })
                     
         return trades
@@ -217,21 +295,37 @@ class TradingSimulator:
 
 if __name__ == "__main__":
     # Initialize simulator with M1 data for precision
-    simulator = TradingSimulator(symbol="XAUUSD", timeframe=mt5.TIMEFRAME_M5, days_back=30)
+    #simulator = TradingSimulator(symbol="XAUUSD", timeframe=mt5.TIMEFRAME_M5, days_back=30)
     
     # Simulate trades with both FVG and liquidity sweep strategies
-    trades_df = simulator.simulate_trades(use_fvg=True, use_sweeps=True, rr_ratio=2.0)
+    #trades_df = simulator.simulate_trades(use_fvg=True, use_sweeps=True, rr_ratio=2.0)
     
     # Generate performance report
-    report = simulator.generate_report(trades_df)
+    #report = simulator.generate_report(trades_df)
     
-    # Print results
-    print("\n=== Performance Report ===")
-    for k, v in report.items():
-        print(f"{k.replace('_', ' ').title()}: {v:.2f}" if isinstance(v, float) else f"{k.replace('_', ' ').title()}: {v}")
-    
-    print("\n=== Last 5 Trades ===")
-    print(trades_df.tail())
+       
+    # Test on different instruments and timeframes
+    symbols = ["UT100Roll", "US500Roll", "XAUUSD"]
+    timeframes = [mt5.TIMEFRAME_M5, mt5.TIMEFRAME_M15]
+    results = {}
+    for sym in symbols:
+        for tf in timeframes:
+            sim = TradingSimulator(
+                symbol=sym, 
+                timeframe=mt5.TIMEFRAME_M5, 
+                days_back=30,
+                account_balance=5000,  # $10,000 starting balance
+                risk_per_trade=0.01      # Risk 1% per trade
+            )
+            trades = sim.simulate_trades()
+            report = sim.generate_report(trades)
+
+            # Print results
+            print("\n=== Performance Report ===")
+            for k, v in report.items():
+                print(f"{k.replace('_', ' ').title()}: {v:.2f}" if isinstance(v, float) else f"{k.replace('_', ' ').title()}: {v}")
+            print("=====================================================================================")
+ 
     
     # Shutdown MT5 connection
     mt5.shutdown()
