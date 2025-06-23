@@ -1204,7 +1204,7 @@ class TradingSimulator:
         final_bias = "neutral"
         reasons = []
 
-        if liquidity_bias == fvg_bias and liquidity_bias != "neutral":
+        if liquidity_bias == fvg_bias and liquidity_bias != "neutral": 
             final_bias = liquidity_bias
             reasons = [max_high if final_bias == "bullish" else min_low, fvg_reason, liquidity_reason]
         #elif liquidity_bias != "neutral":

@@ -407,6 +407,105 @@ class LiveTrader:
                     self.sweep_signals.append((idx, "bullish_sweep", prev_low, atr))
 
     @staticmethod
+    def detect_fvg_liquidity_shifts_v2(
+        df_5m: pd.DataFrame,
+        df_15m: pd.DataFrame,
+        group_size: int = 12,
+        atr_period: int = 14,
+        rr_ratio: float = 2.0,
+        fvg_buffer: float = 0.00015
+    ) -> List[Tuple[pd.Timestamp, str, float, float, float]]:
+        """
+        Detects signals based on:
+        1. Liquidity sweeps on 15m
+        2. FVG zones on 5m directly after sweep (without breaker logic)
+
+        Returns: list of tuples (signal_time, direction, tp, sl, entry)
+        """
+        signals = []
+
+        if len(df_5m) < group_size * 3 or len(df_15m) < group_size:
+            return signals
+
+        # Calculate ATR on 5m
+        tr = pd.concat([
+            df_5m['high'] - df_5m['low'],
+            (df_5m['high'] - df_5m['close'].shift()).abs(),
+            (df_5m['low'] - df_5m['close'].shift()).abs()
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(window=atr_period).mean()
+
+        # Detect sweeps on 15m
+        num_groups = len(df_15m) // group_size
+        prev_highs, prev_lows = [], []
+
+        sweep_signals = []
+        for g in range(1, num_groups):
+            prev_group = df_15m.iloc[(g - 1) * group_size: g * group_size]
+            curr_group = df_15m.iloc[g * group_size: (g + 1) * group_size]
+
+            if len(prev_group) < group_size or len(curr_group) < 3:
+                continue
+
+            prev_high = prev_group['high'].max()
+            prev_low = prev_group['low'].min()
+
+            prev_highs.append(prev_high)
+            prev_lows.append(prev_low)
+
+            for i in range(2, len(curr_group)):
+                candle = curr_group.iloc[i]
+                idx = curr_group.index[i]
+
+                if (candle['high'] > prev_high and candle['close'] < candle['open']):
+                #or \
+                #(any(candle['high'] > x for x in prev_highs) and candle['close'] < candle['open']):
+                    sweep_signals.append((idx, "bearish_sweep", prev_high))
+
+                elif (candle['low'] < prev_low and candle['close'] > candle['open']):
+                #or \
+                #    (any(candle['low'] < x for x in prev_lows) and candle['close'] > candle['open']):
+                    sweep_signals.append((idx, "bullish_sweep", prev_low))
+
+        # Look for FVG after sweep
+        for sweep_time, sweep_type, sweep_level in sweep_signals:
+            end_time = sweep_time + pd.Timedelta(minutes=45)
+            post_sweep_df = df_5m[(df_5m.index >= sweep_time) & (df_5m.index < end_time)]
+
+            if len(post_sweep_df) < 5:
+                continue
+
+            for i in range(len(post_sweep_df) - 3):
+                fvg_candles = post_sweep_df.iloc[i + 1:i + 4]
+                if len(fvg_candles) < 3:
+                    continue
+
+                f1, f2, f3 = fvg_candles.iloc[0], fvg_candles.iloc[1], fvg_candles.iloc[2]
+                idx = fvg_candles.index[2]
+                atr_margin = atr.loc[idx] if idx in atr.index else atr.iloc[-1]
+
+                if sweep_type == "bearish_sweep":
+                    if f3['low'] > (f1['high'] + fvg_buffer) and f3['close'] < f3['open']:
+                        fvg_top = f1['high']
+                        fvg_bottom = f3['low']
+                        entry = (fvg_top + fvg_bottom) / 2
+                        sl = entry + atr_margin
+                        tp = entry - (sl - entry) * rr_ratio
+                        signals.append((idx, "bearish", round(tp, 5), round(sl, 5), round(entry, 5)))
+
+                elif sweep_type == "bullish_sweep":
+                    if f3['high'] < (f1['low'] - fvg_buffer) and f3['close'] > f3['open']:
+                        fvg_bottom = f1['low']
+                        fvg_top = f3['high']
+                        entry = (fvg_top + fvg_bottom) / 2
+                        sl = entry - atr_margin
+                        tp = entry + (entry - sl) * rr_ratio
+                        signals.append((idx, "bullish", round(tp, 5), round(sl, 5), round(entry, 5)))
+
+        return signals
+
+
+    @staticmethod
     def detect_fvg_liquidity_shifts_w_breaker(
         df_5m: pd.DataFrame,
         df_15m: pd.DataFrame,
@@ -682,7 +781,7 @@ class LiveTrader:
                                 entry = c3['close']
                                 sl = c3['high'] + atr.loc[idx3]
                                 tp = entry - (sl - entry) * rr_ratio
-                                signals.append((idx3, "bearish", round(tp, 5), round(sl, 5)))
+                                signals.append((idx3, "bearish", round(tp, 5), round(sl, 5),round(entry,5)))
                                 break
 
                 # === Bullish Setup ===
@@ -699,7 +798,7 @@ class LiveTrader:
                                 entry = c3['close']
                                 sl = c3['low'] - atr.loc[idx3]
                                 tp = entry + (entry - sl) * rr_ratio
-                                signals.append((idx3, "bullish", round(tp, 5), round(sl, 5)))
+                                signals.append((idx3, "bullish", round(tp, 5), round(sl, 5),round(entry,5)))
                                 break
 
         return signals
@@ -847,7 +946,7 @@ class LiveTrader:
 
     def _get_open_position(self):
         """Checks for an open position on the symbol managed by this EA."""
-        positions = mt5.positions_get(symbol=self.symbol)
+        positions = mt5.positions_get()
         if positions is None:
             if mt5.last_error() != mt5.RES_S_OK: # RES_S_OK means "no error", so positions is empty
                  print(f"Error getting positions: {mt5.last_error()}")
@@ -990,7 +1089,9 @@ class LiveTrader:
             self.daily_bias = self._get_daily_bias(window_size=28)
 
         # --- 1. Get Open Position ---
-        open_positions = self._get_open_position()
+        
+        if(mt5.initialize()):
+            open_positions = self._get_open_position()
 
         if len(open_positions)>3:
             for open_position in open_positions:
@@ -1024,6 +1125,7 @@ class LiveTrader:
                     self.active_trade_entry_time = open_position.time # Store it now
 
         else: # No active position for our magic number
+            print(open_positions)
             self.active_trade_ticket = None
             self.active_trade_entry_time = None
             
@@ -1043,7 +1145,7 @@ class LiveTrader:
             # --- 4. Generate Signals ---
             all_signals = []
             if self.use_fvg:                
-                fvg_signals = self.detect_fvg_liquidity_shifts(df_5m=df,df_15m=df_15m,rr_ratio=self.rr_ratio)
+                fvg_signals = self.detect_fvg_liquidity_shifts(df=df,rr_ratio=self.rr_ratio)
                 for ts, direction,take_profit,stop_loss,entry in fvg_signals:
                     bias_direction,bias_reason,bias_time = self.daily_bias
                     if(bias_direction == direction):                    
@@ -1157,7 +1259,7 @@ if __name__ == "__main__":
         magic_number=MAGIC_NUMBER
     )
     
-    schedule.every(5).seconds.do(trader.run_trade_logic)
+    schedule.every(RUN_INTERVAL_SECONDS).seconds.do(trader.run_trade_logic)
     while True:
         schedule.run_pending()
         print(f"Waiting for {RUN_INTERVAL_SECONDS} seconds before next check...")
