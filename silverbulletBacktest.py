@@ -11,10 +11,19 @@ class TradingSimulator:
         self.days_back = days_back
         self.account_balance = account_balance
         self.risk_per_trade = risk_per_trade  # Risk 1% of account per trade
-        self.point_value = self._get_point_value()  # Value per pip/point for the symbol
+        self.point_value = self.get_point_value(symbol)  # Value per pip/point for the symbol
         self.df = self._get_historical_data()
+
+    def get_point_value(self,symbol: str) -> float:
+        info = mt5.symbol_info(symbol)
+        if info and info.trade_tick_size > 0:
+            return (info.trade_tick_value / info.trade_tick_size) * info.point
+        else:
+            # fallback to hardcoded map
+            return self._get_point_value()
+
         
-    def _get_point_value(self) -> float:
+    def  _get_point_value(self) -> float:
         """Get the value per point for the symbol, including indices/futures."""
         point_values = {
             # Forex pairs
@@ -196,27 +205,29 @@ class TradingSimulator:
                     high, low = current_candle['high'], current_candle['low']
                     
                     if signal_dir == "bullish":
-                        if high >= tp:
-                            result = "win"
-                            exit_price = tp
-                            pnl_pips = (tp - entry_price) / self.point_value
-                            #break
-                        elif low <= sl:
+                        if low <= sl:
                             result = "loss"
                             exit_price = sl
                             pnl_pips = (sl - entry_price) / self.point_value
-                            #break
-                    else:
-                        if low <= tp:
+                            break
+                        elif high >= tp:
                             result = "win"
                             exit_price = tp
-                            pnl_pips = (entry_price - tp) / self.point_value
-                            #break
-                        elif high >= sl:
+                            pnl_pips = (tp - entry_price) / self.point_value
+                            break
+                        
+                    else:
+                        if high >= sl:
                             result = "loss"
                             exit_price = sl
                             pnl_pips = (entry_price - sl) / self.point_value
-                            #break
+                            break
+                        elif low <= tp:
+                            result = "win"
+                            exit_price = tp
+                            pnl_pips = (entry_price - tp) / self.point_value
+                            break
+                        
                 
                 if result:
                     # Calculate monetary P&L
@@ -313,8 +324,8 @@ if __name__ == "__main__":
             sim = TradingSimulator(
                 symbol=sym, 
                 timeframe=mt5.TIMEFRAME_M5, 
-                days_back=30,
-                account_balance=5000,  # $10,000 starting balance
+                days_back=300,
+                account_balance=10000,  # $10,000 starting balance
                 risk_per_trade=0.01      # Risk 1% per trade
             )
             trades = sim.simulate_trades()

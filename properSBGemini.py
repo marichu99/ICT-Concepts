@@ -387,7 +387,7 @@ class LiveTrader:
             sl_price = min(ideal_sl, min_allowable_sl_from_broker)
             
             # 3. Ensure SL is actually below the entry price (vital if spread + min_stop_offset is large)
-            sl_price = min(sl_price, entry_price - self.point) # At least one point away
+            sl_price = min(sl_price, entry_price - self.symbol_info.point) # At least one point away
 
 
             # 4. Calculate TP based on your desired distance from entry
@@ -399,7 +399,7 @@ class LiveTrader:
             tp_price = max(ideal_tp, min_allowable_tp_from_broker)
 
             # 6. Ensure TP is actually above the entry price
-            tp_price = max(tp_price, entry_price + self.point)
+            tp_price = max(tp_price, entry_price + self.symbol_info.point)
 
 
         elif trade_direction == "bearish": # SELL order
@@ -414,7 +414,7 @@ class LiveTrader:
             sl_price = max(ideal_sl, min_allowable_sl_from_broker)
 
             # 3. Ensure SL is actually above the entry price
-            sl_price = max(sl_price, entry_price + self.point)
+            sl_price = max(sl_price, entry_price + self.symbol_info.point)
 
 
             # 4. Calculate TP based on your desired distance from entry
@@ -426,7 +426,7 @@ class LiveTrader:
             tp_price = min(ideal_tp, min_allowable_tp_from_broker)
 
             # 6. Ensure TP is actually below the entry price
-            tp_price = min(tp_price, entry_price - self.point)
+            tp_price = min(tp_price, entry_price - self.symbol_info.point)
 
         # Round to the symbol's digit precision
         sl_price = round(sl_price, self.digits)

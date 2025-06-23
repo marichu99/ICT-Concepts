@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta,timezone
 from typing import List, Dict, Optional, Tuple
+import pytz
 
 class TradingSimulator:
     def __init__(self, symbol: str, timeframe: int, days_back: int = 150, account_balance: float = 10000, risk_per_trade: float = 0.01):
@@ -29,10 +30,11 @@ class TradingSimulator:
         self.symbol_info = self._get_symbol_info()
         if self.symbol_info is None:
             error_message = f"Could not retrieve symbol info for {self.symbol}. Error: {mt5.last_error()}"
+            print(f"Could not retrieve symbol info for {self.symbol}. Error: {mt5.last_error()}")
             mt5.shutdown()
             raise ValueError(error_message)
             
-        self.df = self._get_historical_data()
+        self.df = self._get_filtered_data()
         self.current_trade_id = 0
 
 
@@ -67,28 +69,47 @@ class TradingSimulator:
             return fixed_lot
         
 
-    def _get_historical_data(self) -> pd.DataFrame:
-        """Fetch historical data from MT5."""
+    def _get_filtered_data(self) -> pd.DataFrame:
+        """
+        Fetches historical data from MetaTrader 5 and filters it to New York time intervals.
+        Time intervals: 2–3 AM, 10–11 AM, 2–3 PM (New York time, DST-aware).
+
+        """
         start_date = datetime.now(timezone.utc) - timedelta(days=self.days_back)
         end_date = datetime.now(timezone.utc)
 
-        print(f"Fetching data for: {self.symbol}")
-        print(f"Timeframe: {self.timeframe_to_string(self.timeframe)}")
-        print(f"Start date: {start_date.strftime('%Y-%m-%d %H:%M')}")
-        print(f"End date: {end_date.strftime('%Y-%m-%d %H:%M')}")
-
+        print(f"The start date {start_date} the end date  {end_date}")
+        # Fetch recent bars
         rates = mt5.copy_rates_range(self.symbol, self.timeframe, start_date, end_date)
         if rates is None or len(rates) == 0:
-            error_message = f"Failed to fetch historical data for {self.symbol}. Error: {mt5.last_error()}, Rates count: {len(rates) if rates is not None else 'None'}"
-            # mt5.shutdown() # Keep MT5 running for other simulations
-            raise ValueError(error_message)
-            
+            raise Exception("No data returned for symbol: " + self.symbol)
+
+        # Convert to DataFrame
         df = pd.DataFrame(rates)
+        
+        # Convert timestamp to datetime and localize to UTC
+        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+
+        # Convert to New York time (handles DST)
+        ny_tz = pytz.timezone("America/New_York")
+        df['time_ny'] = df['time'].dt.tz_convert(ny_tz)
+        
+        # Extract hour and minute
+        df['hour'] = df['time_ny'].dt.hour
+       
+        # Filter to allowed hours
+        df = df[df['hour'].isin([2, 10, 14])]
+
+        # Drop helper columns
+        df = df.drop(columns=['hour'])
+
         print(f"Fetched {len(df)} rates for {self.symbol}.")
         df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
         df.set_index('time', inplace=True)
+
         return df
-    
+
+        
     @staticmethod
     def timeframe_to_string(tf_int: int) -> str:
         """Converts MT5 timeframe integer to a readable string."""
@@ -102,6 +123,59 @@ class TradingSimulator:
             mt5.TIMEFRAME_D1: "D1", mt5.TIMEFRAME_W1: "W1", mt5.TIMEFRAME_MN1: "MN1"
         }
         return tf_map.get(tf_int, f"UnknownTF({tf_int})")
+
+    @staticmethod
+    def detect_fvg_w_sweeps_atr(df: pd.DataFrame, lookback: int = 20, atr_period: int = 14) -> List[Tuple[pd.Timestamp, str]]:
+        """
+        Detect Fair Value Gaps with liquidity sweeps using ATR as dynamic threshold.
+        """
+        fvg = []
+        if len(df) < max(lookback, atr_period) + 2:
+            return fvg
+
+        # Calculate True Range (TR)
+        high = df['high']
+        low = df['low']
+        close = df['close']
+        
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs()
+        ], axis=1).max(axis=1)
+        
+        # Calculate ATR
+        atr = tr.rolling(window=atr_period).mean()
+
+        for i in range(max(lookback, atr_period) + 2, len(df)):
+            lookback_high_max = df.iloc[i-lookback:i-2]['high'].max()
+            lookback_low_min = df.iloc[i-lookback:i]['low'].min()
+
+            candle1_high = df.iloc[i-2]['high']
+            candle1_low = df.iloc[i-2]['low']
+
+            candle3_high = df.iloc[i]['high']
+            candle3_close = df.iloc[i]['close']
+            candle3_open = df.iloc[i]['open']
+            candle3_low = df.iloc[i]['low']
+
+            atr_margin = atr.iloc[i]
+
+            # Sweep of equal highs → Bearish FVG
+            if candle3_high > lookback_high_max and candle3_close < candle3_open:
+                sweep_margin = candle3_high - lookback_high_max
+                if sweep_margin <= atr_margin and candle3_low > candle1_high:
+                    fvg.append((df.index[i], "bullish"))
+
+            # Sweep of equal lows → Bullish FVG
+            elif candle3_low < lookback_low_min and candle3_close > candle3_open:
+                sweep_margin = lookback_low_min - candle3_low
+                if sweep_margin <= atr_margin and candle3_high < candle1_low:
+                    fvg.append((df.index[i], "bearish"))
+
+        return fvg
+
 
     @staticmethod
     def detect_fvg(df: pd.DataFrame) -> List[Tuple[pd.Timestamp, str]]:
@@ -123,12 +197,13 @@ class TradingSimulator:
             
             # Bullish FVG: Candle 3's Low is above Candle 1's High
             if candle3_low > candle1_high:
-                fvg.append((df.index[i], "bullish")) # Signal on close of Candle 3
+                fvg.append((df.index[i], "bearish")) # Signal on close of Candle 3
                 
             # Bearish FVG: Candle 3's High is below Candle 1's Low
             elif candle3_high < candle1_low:
-                fvg.append((df.index[i], "bearish")) # Signal on close of Candle 3
+                fvg.append((df.index[i], "bullish")) # Signal on close of Candle 3
         return fvg
+    
     @staticmethod
     def detect_fvg_w_sweeps(df: pd.DataFrame,lookback: int=20) -> List[Tuple[pd.Timestamp, str]]:
         """Detect Fair Value Gaps in price data (standard 3-candle pattern)."""
@@ -170,7 +245,7 @@ class TradingSimulator:
         return fvg
     
     @staticmethod
-    def detect_liquidity_sweeps(df: pd.DataFrame, lookback: int = 20) -> List[Tuple[pd.Timestamp, str]]:
+    def detect_liquidity_sweeps(df: pd.DataFrame, lookback: int = 30) -> List[Tuple[pd.Timestamp, str]]:
         """Detect liquidity sweeps (false breakouts)."""
         sweeps = []
         if len(df) < lookback + 1 : # Ensure enough data for lookback
@@ -206,7 +281,7 @@ class TradingSimulator:
 
     def simulate_trades(self, use_fvg: bool = True, use_sweeps: bool = True, rr_ratio: float = 2.0, sl_points_fixed: int = 200, enable_compounding: bool = False) -> pd.DataFrame:
         """Simulate trades based on selected strategies."""
-       
+    
         trades = []
         self.account_balance = self.initial_account_balance # Reset balance for each simulation run
         self.current_trade_id = 0
@@ -232,6 +307,7 @@ class TradingSimulator:
 
         # trades_df.to_csv(f"trades_{self.symbol}_{self.timeframe_to_string(self.timeframe)}.csv")
         return trades_df
+    
     def _get_sub_timeframe_data(self, start_time: pd.Timestamp, end_time: pd.Timestamp, sub_timeframe: int) -> pd.DataFrame:
         """
         Fetches historical data for a smaller timeframe within a given range.
@@ -256,8 +332,8 @@ class TradingSimulator:
         value_per_point_per_lot = (self.symbol_info.trade_tick_value / self.symbol_info.trade_tick_size) * self.symbol_info.point if self.symbol_info.trade_tick_size > 0 else 0
 
         for signal_time, signal_details in signals: # signal_details contains direction, e.g., "bullish" or "bearish_sweep_reversal_long"
-            if not self.in_london_newyork_window(signal_time):
-                continue
+            #if not self.in_london_newyork_window(signal_time):
+            #    continue
                 
             entry_idx = self.df.index.get_loc(signal_time)
             if entry_idx + 3 >= len(self.df): # Need at least 3 candles for entry fill check
@@ -316,8 +392,8 @@ class TradingSimulator:
                 
             lot_size = self._calculate_lot_size(entry_price, sl)
             if lot_size == 0 or lot_size < self.symbol_info.volume_min : # Check if lot size is valid
-                 print(f"Skipping trade at {signal_time} due to invalid lot size: {lot_size}")
-                 continue
+                print(f"Skipping trade at {signal_time} due to invalid lot size: {lot_size}")
+                continue
             
             # Check if price fills the entry zone (next 3 candles)
             # For a buy, we need low of future candles to touch entry_price.
@@ -328,7 +404,7 @@ class TradingSimulator:
 
             # Check for fill within next 3 candles (or immediate fill on signal candle itself)
             if (signal_direction == "bullish" and entry_candle['low'] <= entry_price and entry_candle['high'] >= entry_price) or \
-               (signal_direction == "bearish" and entry_candle['low'] <= entry_price and entry_candle['high'] >= entry_price):
+            (signal_direction == "bearish" and entry_candle['low'] <= entry_price and entry_candle['high'] >= entry_price):
                 filled = True # Filled on the signal candle itself
 
             if not filled:
@@ -364,42 +440,43 @@ class TradingSimulator:
                 timeout_end_time = self.df.index[monitoring_window_end_idx - 1] + pd.Timedelta(self.timeframe, unit='s') # End of the last candle
 
                 minute_data = self._get_sub_timeframe_data(timeout_start_time, timeout_end_time, mt5.TIMEFRAME_M1)
-                #for _, m1_candle in minute_data.iterrows():
+                for _, m1_candle in minute_data.iterrows():
 
-                for i in range(start_tracking_idx, monitoring_window_end_idx):
-                    current_candle_trade = self.df.iloc[i]
-                    #high, low = m1_candle['high'], m1_candle['low']
-                    high, low = current_candle_trade['high'], current_candle_trade['low']
+                #for i in range(start_tracking_idx, monitoring_window_end_idx):
+                #while True:
+                    #current_candle_trade = self.df.iloc[i]
+                    high, low = m1_candle['high'], m1_candle['low']
+                    #high, low = current_candle_trade['high'], current_candle_trade['low']
                     
                     if signal_direction == "bullish": # Buy trade
                         if high >= tp: # Check TP first
                             result = "win"
                             exit_price = tp
                             pnl_points = (tp - actual_entry_price) / self.symbol_info.point
-                            #exit_time = m1_candle.name
-                            exit_time = self.df.index[i]
+                            exit_time = m1_candle.name
+                            #exit_time = self.df.index[i]
                             break
                         elif low <= sl:
                             result = "loss"
                             exit_price = sl
                             pnl_points = (sl - actual_entry_price) / self.symbol_info.point
-                            #exit_time = m1_candle.name
-                            exit_time = self.df.index[i]
+                            exit_time = m1_candle.name
+                            #exit_time = self.df.index[i]
                             break
                     elif signal_direction == "bearish": # Sell trade
                         if low <= tp: # Check TP first
                             result = "win"
                             exit_price = tp
                             pnl_points = (actual_entry_price - tp) / self.symbol_info.point
-                            #exit_time = m1_candle.
-                            exit_time = self.df.index[i]
+                            exit_time = m1_candle.name
+                            #exit_time = self.df.index[i]
                             break
                         elif high >= sl:
                             result = "loss"
                             exit_price = sl
                             pnl_points = (actual_entry_price - sl) / self.symbol_info.point
-                            #exit_time = m1_candle.name
-                            exit_time = self.df.index[i]
+                            exit_time = m1_candle.name
+                            #exit_time = self.df.index[i]
                             break
                 
                 # --- NEW LOGIC: Granular Check for "Loss Exceeds Potential Profit" within Timeout ---
@@ -410,7 +487,8 @@ class TradingSimulator:
                     timeout_start_time = self.df.index[start_tracking_idx]
                     timeout_end_time = self.df.index[monitoring_window_end_idx - 1] + pd.Timedelta(self.timeframe, unit='s') # End of the last candle
 
-                    #print(f"The timeout start time is {timeout_start_time} and the entry time is {entry_fill_time}")
+
+                    print(f"The timeout start time is {timeout_start_time} and the entry time is {entry_fill_time}")
 
                     # Fetch minute data for this entire potential timeout window
                     # This is the "going granular" part
@@ -449,7 +527,7 @@ class TradingSimulator:
                                 break # Exit the M1 loop
                         
                         elif signal_direction == "bearish":
-                           
+                        
                             # For sell, check if M1 low hits or crosses below TP
                             if m1_low <= tp:
                                 result = "win"
@@ -518,13 +596,12 @@ class TradingSimulator:
                 
                 trade_data["balance_after_trade"] = self.account_balance if not enable_compounding else self.account_balance # if not compounding, it shows balance without this PnL; if compounding, it is updated
                 if not enable_compounding: # If not compounding, show what balance would be with this pnl
-                     trade_data["balance_after_trade"] = trade_data["initial_balance_for_trade"] + pnl
+                    trade_data["balance_after_trade"] = trade_data["initial_balance_for_trade"] + pnl
 
 
                 processed_trades.append(trade_data)
                     
         return processed_trades
-    
 
     @staticmethod
     def calculate_sl(candles:pd.DataFrame, trade_type:str, pip_size:float=0.01, lookback:int=20, buffer_pips:int=3):
@@ -611,9 +688,9 @@ class TradingSimulator:
             # Fallback to cumulative PnL from initial for drawdown calculation
             equity_curve = self.initial_account_balance + trades_df['pnl'].cumsum()
         elif current_balance_col and any(col in trades_df.columns for col in ['initial_balance_for_trade']):
-             # If compounding is off, balance_after_trade is initial_balance_for_trade + pnl
-             # If compounding is on, balance_after_trade is the running balance
-             # The logic in _process_signals for 'balance_after_trade' aims to reflect this.
+            # If compounding is off, balance_after_trade is initial_balance_for_trade + pnl
+            # If compounding is on, balance_after_trade is the running balance
+            # The logic in _process_signals for 'balance_after_trade' aims to reflect this.
             equity_curve = trades_df[current_balance_col]
         else: # Fallback if balance columns are not as expected
             print("Warning: Suitable balance column not found for drawdown. Using PnL cumsum from initial balance.")
@@ -666,45 +743,45 @@ if __name__ == "__main__":
     for sym in symbols_to_test:
         for tf_val in timeframes_to_test:
             print(f"\n{'='*30} SIMULATING: {sym} - {TradingSimulator.timeframe_to_string(tf_val)} {'='*30}")
-            try:
-                sim = TradingSimulator(
-                    symbol=sym, 
-                    timeframe=tf_val, 
-                    days_back=30,             # How many days of data
-                    account_balance=10000,    # Starting balance
-                    risk_per_trade=0.01       # Risk 1% per trade
-                )
-                
-                trades_df = sim.simulate_trades(
-                    use_fvg=False, 
-                    use_sweeps=True, 
-                    rr_ratio=2.0,             # Risk:Reward Ratio
-                    sl_points_fixed=150,      # Stop loss in points (e.g., for EURUSD 150 points = 15 pips if point=0.0001)
-                                              # For XAUUSD 150 points = $1.50 if point=0.01
-                    enable_compounding=True
-                )
+            #try:
+            sim = TradingSimulator(
+                symbol=sym, 
+                timeframe=tf_val, 
+                days_back=30,             # How many days of data
+                account_balance=10000,    # Starting balance
+                risk_per_trade=0.01       # Risk 1% per trade
+            )
+            
+            trades_df = sim.simulate_trades(
+                use_fvg=True, 
+                use_sweeps=True, 
+                rr_ratio=3.0,             # Risk:Reward Ratio
+                sl_points_fixed=400,      # Stop loss in points (e.g., for EURUSD 150 points = 15 pips if point=0.0001)
+                                            # For XAUUSD 150 points = $1.50 if point=0.01
+                enable_compounding=True
+            )
 
-                if not trades_df.empty:
-                    trades_df.to_csv(f"trades_{sym}_{sim.timeframe_to_string(tf_val)}.csv")
-                    print(f"\n--- Trades for {sym} - {sim.timeframe_to_string(tf_val)} ---")
-                    print(trades_df[['signal_time', 'type', 'position', 'entry','sl','tp', 'exit_price', 'result', 'pnl', 'lot_size']].head())
-                
-                report = sim.generate_report(trades_df)
-                
-                print(f"\n--- Performance Report for {sym} - {sim.timeframe_to_string(tf_val)} ---")
-                for k, v in report.items():
-                    if isinstance(v, float):
-                        print(f"{k.replace('_', ' ').title()}: {v:.2f}")
-                    else:
-                        print(f"{k.replace('_', ' ').title()}: {v}")
-                all_results_summary.append({
-                    "symbol": sym, 
-                    "timeframe": sim.timeframe_to_string(tf_val),
-                    **report # Add all report items
-                })
+            if not trades_df.empty:
+                trades_df.to_csv(f"trades_{sym}_{sim.timeframe_to_string(tf_val)}.csv")
+                print(f"\n--- Trades for {sym} - {sim.timeframe_to_string(tf_val)} ---")
+                print(trades_df[['signal_time', 'type', 'position', 'entry','sl','tp', 'exit_price', 'result', 'pnl', 'lot_size']].head())
+            
+            report = sim.generate_report(trades_df)
+            
+            print(f"\n--- Performance Report for {sym} - {sim.timeframe_to_string(tf_val)} ---")
+            for k, v in report.items():
+                if isinstance(v, float):
+                    print(f"{k.replace('_', ' ').title()}: {v:.2f}")
+                else:
+                    print(f"{k.replace('_', ' ').title()}: {v}")
+            all_results_summary.append({
+                "symbol": sym, 
+                "timeframe": sim.timeframe_to_string(tf_val),
+                **report # Add all report items
+            })
 
-            except (RuntimeError, ValueError, Exception) as e:
-                print(f"!!! ERROR during simulation for {sym} - {TradingSimulator.timeframe_to_string(tf_val)}: {str(e)}")
+            #except (RuntimeError, ValueError, Exception) as e:
+            #    print(f"!!! ERROR during simulation for {sym} - {TradingSimulator.timeframe_to_string(tf_val)}: {e}")
             print(f"{'='*80}\n")
 
     # Shutdown MT5 connection once all simulations are done

@@ -302,14 +302,14 @@ class TradingSimulator:
                 continue
 
 
-            #sl = self.calculate_sl(self.df.to_dict('records'), position_type)
+            sl = self.calculate_sl(self.df.to_dict('records'), position_type)
 
             if signal_direction == "bullish": # Buy trade
-
-                sl = entry_price - sl_distance_price - spread
+            
+                #sl = entry_price - sl_distance_price - spread
                 tp = entry_price + tp_distance_price + spread
             elif signal_direction == "bearish": # Sell trade
-                sl = entry_price + sl_distance_price + spread
+                #sl = entry_price + sl_distance_price + spread
                 tp = entry_price - tp_distance_price -spread
             else: # Should not happen if position_type is set
                 continue 
@@ -360,15 +360,9 @@ class TradingSimulator:
                 # Max 12 candles *after fill* for trade duration
                 start_tracking_idx = self.df.index.get_loc(entry_fill_time) + 1
                 monitoring_window_end_idx = min(start_tracking_idx + 12, len(self.df))
-                timeout_start_time = self.df.index[start_tracking_idx]
-                timeout_end_time = self.df.index[monitoring_window_end_idx - 1] + pd.Timedelta(self.timeframe, unit='s') # End of the last candle
-
-                minute_data = self._get_sub_timeframe_data(timeout_start_time, timeout_end_time, mt5.TIMEFRAME_M1)
-                #for _, m1_candle in minute_data.iterrows():
 
                 for i in range(start_tracking_idx, monitoring_window_end_idx):
                     current_candle_trade = self.df.iloc[i]
-                    #high, low = m1_candle['high'], m1_candle['low']
                     high, low = current_candle_trade['high'], current_candle_trade['low']
                     
                     if signal_direction == "bullish": # Buy trade
@@ -376,14 +370,12 @@ class TradingSimulator:
                             result = "win"
                             exit_price = tp
                             pnl_points = (tp - actual_entry_price) / self.symbol_info.point
-                            #exit_time = m1_candle.name
                             exit_time = self.df.index[i]
                             break
                         elif low <= sl:
                             result = "loss"
                             exit_price = sl
                             pnl_points = (sl - actual_entry_price) / self.symbol_info.point
-                            #exit_time = m1_candle.name
                             exit_time = self.df.index[i]
                             break
                     elif signal_direction == "bearish": # Sell trade
@@ -391,98 +383,27 @@ class TradingSimulator:
                             result = "win"
                             exit_price = tp
                             pnl_points = (actual_entry_price - tp) / self.symbol_info.point
-                            #exit_time = m1_candle.
                             exit_time = self.df.index[i]
                             break
                         elif high >= sl:
                             result = "loss"
                             exit_price = sl
-                            pnl_points = (actual_entry_price - sl) / self.symbol_info.point
-                            #exit_time = m1_candle.name
+                            pnl_points = (sl- actual_entry_price) / self.symbol_info.point
                             exit_time = self.df.index[i]
                             break
-                
-                # --- NEW LOGIC: Granular Check for "Loss Exceeds Potential Profit" within Timeout ---
-                if result is None: # Trade still active after main timeframe check (i.e., it would be a "timeout")
-                    
-                    # Determine the actual time range for the potential timeout candles
-                    # This is from the start_tracking_idx up to the end of the 12-candle window
-                    timeout_start_time = self.df.index[start_tracking_idx]
-                    timeout_end_time = self.df.index[monitoring_window_end_idx - 1] + pd.Timedelta(self.timeframe, unit='s') # End of the last candle
 
-                    #print(f"The timeout start time is {timeout_start_time} and the entry time is {entry_fill_time}")
-
-                    # Fetch minute data for this entire potential timeout window
-                    # This is the "going granular" part
-                    minute_data = self._get_sub_timeframe_data(timeout_start_time, timeout_end_time, mt5.TIMEFRAME_M1)
-
-                    early_exit_loss_triggered = False
-                    exit_candle_m1 = None
-
-                    potential_profit_points = tp_distance_price / self.symbol_info.point
-
-                    for _, m1_candle in minute_data.iterrows():
-                        m1_high, m1_low = m1_candle['high'], m1_candle['low']
-                        m1_close = m1_candle['close']
-
-                        current_unrealized_pnl_points_m1 = 0.0
-
-                        if signal_direction == "bullish":
-                            
-                            # For buy, check if M1 high hits or crosses above TP
-                            if m1_high >= tp:
-                                result = "win"
-                                exit_price = tp
-                                pnl_points = (tp - actual_entry_price) / self.symbol_info.point
-                                exit_time = m1_candle.name
-                                early_exit_loss_triggered = False # TP hit, not early exit loss
-                                break
-                            
-                            # If not SL/TP, check for "loss exceeds potential profit" using M1 low
-                            current_unrealized_pnl_points_m1 = (m1_low - actual_entry_price) / self.symbol_info.point # Worst point in candle
-                            if current_unrealized_pnl_points_m1 < 0 and abs(current_unrealized_pnl_points_m1) > potential_profit_points:
-                                result = "early_exit_loss"
-                                exit_price = m1_low # Exit at the point the condition was met
-                                pnl_points = current_unrealized_pnl_points_m1
-                                exit_time = m1_candle.name
-                                early_exit_loss_triggered = True
-                                break # Exit the M1 loop
-                        
-                        elif signal_direction == "bearish":
-                           
-                            # For sell, check if M1 low hits or crosses below TP
-                            if m1_low <= tp:
-                                result = "win"
-                                exit_price = tp
-                                pnl_points = (actual_entry_price - tp) / self.symbol_info.point
-                                exit_time = m1_candle.name
-                                early_exit_loss_triggered = False # TP hit, not early exit loss
-                                break
-
-                            # If not SL/TP, check for "loss exceeds potential profit" using M1 high
-                            current_unrealized_pnl_points_m1 = (actual_entry_price - m1_high) / self.symbol_info.point # Worst point in candle
-                            if current_unrealized_pnl_points_m1 < 0 and abs(current_unrealized_pnl_points_m1) > potential_profit_points:
-                                result = "early_exit_loss"
-                                exit_price = m1_high # Exit at the point the condition was met
-                                pnl_points = current_unrealized_pnl_points_m1
-                                exit_time = m1_candle.name
-                                
-                                early_exit_loss_triggered = True
-                                break # Exit the M1 loop
-                    
-                    # If after checking all M1 candles, no SL/TP or early_exit_loss was triggered
-                    if result is None:
-                        result = "timeout"
-                        # Exit at close of the last candle in the monitoring window (main timeframe)
-                        # This covers the case where the M1 data for the very last part of the timeout period might be incomplete,
-                        # or the condition wasn't met on any M1 candle.
-                        exit_price = self.df.iloc[monitoring_window_end_idx - 1]['close']
-                        exit_time = self.df.index[monitoring_window_end_idx - 1]
-                        if signal_direction == "bullish":
-                            pnl_points = (exit_price - actual_entry_price) / self.symbol_info.point
-                        else: # Bearish
-                            pnl_points = (actual_entry_price - exit_price) / self.symbol_info.point
-
+                # If after checking all M1 candles, no SL/TP or early_exit_loss was triggered
+                if result is None:
+                    result = "timeout"
+                    # Exit at close of the last candle in the monitoring window (main timeframe)
+                    # This covers the case where the M1 data for the very last part of the timeout period might be incomplete,
+                    # or the condition wasn't met on any M1 candle.
+                    exit_price = self.df.iloc[monitoring_window_end_idx - 1]['close']
+                    exit_time = self.df.index[monitoring_window_end_idx - 1]
+                    if signal_direction == "bullish":
+                        pnl_points = (exit_price - actual_entry_price) / self.symbol_info.point
+                    else: # Bearish
+                        pnl_points = (actual_entry_price - exit_price) / self.symbol_info.point
                 # Continue with PnL calculation and trade data logging as before
                 value_per_point_per_lot = (self.symbol_info.trade_tick_value / self.symbol_info.trade_tick_size) \
                                         * self.symbol_info.point if self.symbol_info.trade_tick_size > 0 else 0.0
@@ -527,7 +448,7 @@ class TradingSimulator:
     
 
     @staticmethod
-    def calculate_sl(candles:pd.DataFrame, trade_type:str, pip_size:float=0.01, lookback:int=20, buffer_pips:int=3):
+    def  calculate_sl(candles:pd.DataFrame, trade_type:str, pip_size:float=0.01, lookback:int=20, buffer_pips:int=3):
         """
         Calculates SL based on recent highs/lows.
         For 'sell' trades: SL = highest high over last `lookback` candles + buffer.
@@ -670,15 +591,15 @@ if __name__ == "__main__":
                 sim = TradingSimulator(
                     symbol=sym, 
                     timeframe=tf_val, 
-                    days_back=30,             # How many days of data
+                    days_back=90,             # How many days of data
                     account_balance=10000,    # Starting balance
                     risk_per_trade=0.01       # Risk 1% per trade
                 )
                 
                 trades_df = sim.simulate_trades(
-                    use_fvg=False, 
+                    use_fvg=True, 
                     use_sweeps=True, 
-                    rr_ratio=2.0,             # Risk:Reward Ratio
+                    rr_ratio=3.0,             # Risk:Reward Ratio
                     sl_points_fixed=150,      # Stop loss in points (e.g., for EURUSD 150 points = 15 pips if point=0.0001)
                                               # For XAUUSD 150 points = $1.50 if point=0.01
                     enable_compounding=True

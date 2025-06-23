@@ -9,7 +9,7 @@ load_dotenv()
 
 # Email configuration
 EMAIL_ADDRESS = "marichufx@gmail.com"
-EMAIL_PASSWORD = os.getenv("APP_PASSWORD")
+EMAIL_PASSWORD = os.getenv("SMTP_PASSWORD")
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 NOTIFY_EMAIL = "martinmaati31@gmail.com"
@@ -34,6 +34,7 @@ def send_email_notification(subject, body):
         print("Notification email sent successfully.")
     except Exception as e:
         print(f"Error sending email: {e}")
+
 
 
 
