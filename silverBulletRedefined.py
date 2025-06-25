@@ -338,7 +338,7 @@ class TradingSimulator:
         """
         Detects signals based on:
         1. Liquidity sweeps on 15m
-        2. FVG zones on 5m directly after sweep (without breaker logic)
+        2. MSS + FVG zones on 5m within 6 candles after sweep
 
         Returns: list of tuples (signal_time, direction, tp, sl, entry)
         """
@@ -364,7 +364,7 @@ class TradingSimulator:
             prev_group = df_15m.iloc[(g - 1) * group_size: g * group_size]
             curr_group = df_15m.iloc[g * group_size: (g + 1) * group_size]
 
-            if len(prev_group) < group_size or len(curr_group) < 3:
+            if len(prev_group) < group_size or len(curr_group) < 4:
                 continue
 
             prev_high = prev_group['high'].max()
@@ -373,56 +373,62 @@ class TradingSimulator:
             prev_highs.append(prev_high)
             prev_lows.append(prev_low)
 
-            for i in range(2, len(curr_group)):
+            for i in range(3, len(curr_group)):
                 candle = curr_group.iloc[i]
                 idx = curr_group.index[i]
 
                 if (candle['high'] > prev_high and candle['close'] < candle['open']):
-                #or \
-                #(any(candle['high'] > x for x in prev_highs) and candle['close'] < candle['open']):
                     sweep_signals.append((idx, "bearish_sweep", prev_high))
-
                 elif (candle['low'] < prev_low and candle['close'] > candle['open']):
-                #or \
-                #    (any(candle['low'] < x for x in prev_lows) and candle['close'] > candle['open']):
                     sweep_signals.append((idx, "bullish_sweep", prev_low))
 
-        # Look for FVG after sweep
+        # Look for MSS + FVG in 5m after sweep
         for sweep_time, sweep_type, sweep_level in sweep_signals:
-            end_time = sweep_time + pd.Timedelta(minutes=45)
+            end_time = sweep_time + pd.Timedelta(minutes=60)
             post_sweep_df = df_5m[(df_5m.index >= sweep_time) & (df_5m.index < end_time)]
 
-            if len(post_sweep_df) < 5:
+            if len(post_sweep_df) < 6:
                 continue
 
-            for i in range(len(post_sweep_df) - 3):
-                fvg_candles = post_sweep_df.iloc[i + 1:i + 4]
-                if len(fvg_candles) < 3:
-                    continue
+            for i in range(0, len(post_sweep_df) - 6):
+                for j in range(1, 7):
+                    if i + j + 2 >= len(post_sweep_df):
+                        break
 
-                f1, f2, f3 = fvg_candles.iloc[0], fvg_candles.iloc[1], fvg_candles.iloc[2]
-                idx = fvg_candles.index[2]
-                atr_margin = atr.loc[idx] if idx in atr.index else atr.iloc[-1]
+                    f1 = post_sweep_df.iloc[i + j]
+                    f2 = post_sweep_df.iloc[i + j + 1]
+                    f3 = post_sweep_df.iloc[i + j + 2]
+                    idx = f3.name
+                    atr_margin = atr.loc[idx] if idx in atr.index else atr.iloc[-1]
 
-                if sweep_type == "bearish_sweep":
-                    if f3['low'] > (f1['high'] + fvg_buffer) and f3['close'] < f3['open']:
-                        fvg_top = f1['high']
-                        fvg_bottom = f3['low']
-                        entry = (fvg_top + fvg_bottom) / 2
-                        sl = entry + atr_margin
-                        tp = entry - (sl - entry) * rr_ratio
-                        signals.append((idx, "bearish", round(tp, 5), round(sl, 5), round(entry, 5)))
+                    if sweep_type == "bearish_sweep":
+                        if (
+                            f3['high'] < f2['high'] and
+                            f3['close'] < f2['close'] and
+                            f3['low'] > (f1['high'] + fvg_buffer) and
+                            f3['close'] < f3['open']
+                        ):
+                            entry = (f1['high'] + f3['low']) / 2
+                            sl = entry + atr_margin
+                            tp = entry - (sl - entry) * rr_ratio
+                            signals.append((idx, "bearish", round(tp, 5), round(sl, 5), round(entry, 5)))
+                            break  # Avoid multiple signals per sweep
 
-                elif sweep_type == "bullish_sweep":
-                    if f3['high'] < (f1['low'] - fvg_buffer) and f3['close'] > f3['open']:
-                        fvg_bottom = f1['low']
-                        fvg_top = f3['high']
-                        entry = (fvg_top + fvg_bottom) / 2
-                        sl = entry - atr_margin
-                        tp = entry + (entry - sl) * rr_ratio
-                        signals.append((idx, "bullish", round(tp, 5), round(sl, 5), round(entry, 5)))
+                    elif sweep_type == "bullish_sweep":
+                        if (
+                            f3['low'] > f2['low'] and
+                            f3['close'] > f2['close'] and
+                            f3['high'] < (f1['low'] - fvg_buffer) and
+                            f3['close'] > f3['open']
+                        ):
+                            entry = (f1['low'] + f3['high']) / 2
+                            sl = entry - atr_margin
+                            tp = entry + (entry - sl) * rr_ratio
+                            signals.append((idx, "bullish", round(tp, 5), round(sl, 5), round(entry, 5)))
+                            break  # Avoid multiple signals per sweep
 
         return signals
+
 
     @staticmethod
     def detect_fvg_liquidity_shifts_w_flipped_signals(
