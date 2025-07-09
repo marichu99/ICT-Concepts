@@ -405,7 +405,7 @@ class LiveTrader:
                     self.sweep_signals.append((idx, "bullish_sweep", prev_low, atr))
 
     @staticmethod
-    def detect_fvg_liquidity_shifts_v2(
+    def detect_fvg_liquidity_shifts_v2(self,
         df_5m: pd.DataFrame,
         df_15m: pd.DataFrame,
         group_size: int = 12,
@@ -480,6 +480,9 @@ class LiveTrader:
                     f3 = post_sweep_df.iloc[i + j + 2]
                     idx = f3.name
                     atr_margin = atr.loc[idx] if idx in atr.index else atr.iloc[-1]
+                    symbol_info = mt5.symbol_info(self.symbol)
+                    point = symbol_info.point  # 0.01
+                    sl_offset = 3.0  # 3 index points
 
                     if sweep_type == "bearish_sweep":
                         if (
@@ -489,9 +492,14 @@ class LiveTrader:
                             f3['close'] < f3['open']
                         ):
                             entry = (f1['high'] + f3['low']) / 2
-                            sl = entry + atr_margin
-                            tp = entry - (sl - entry) * rr_ratio
-                            signals.append((idx, "bearish", round(tp, 5), round(sl, 5), round(entry, 5)))
+                            
+
+                            sl = round(entry + sl_offset, 2)
+                            tp = round(entry - sl_offset * rr_ratio, 2)
+
+                            info = mt5.symbol_info(self.symbol)  # or whatever your symbol name is
+
+                            signals.append((idx, "bearish", tp,sl, round(entry, 2)))
                             break  # Avoid multiple signals per sweep
 
                     elif sweep_type == "bullish_sweep":
@@ -502,9 +510,10 @@ class LiveTrader:
                             f3['close'] > f3['open']
                         ):
                             entry = (f1['low'] + f3['high']) / 2
-                            sl = entry - atr_margin
-                            tp = entry + (entry - sl) * rr_ratio
-                            signals.append((idx, "bullish", round(tp, 5), round(sl, 5), round(entry, 5)))
+                            sl = round(entry - sl_offset, 2)
+                            tp = round(entry + sl_offset * rr_ratio, 2)
+                            
+                            signals.append((idx, "bullish", tp, sl, round(entry, 2)))
                             break  # Avoid multiple signals per sweep
 
         return signals
@@ -1150,7 +1159,7 @@ class LiveTrader:
             # --- 4. Generate Signals ---
             all_signals = []
             if self.use_fvg:                
-                fvg_signals = self.detect_fvg_liquidity_shifts_v2(df_5m=df,df_15m=df_15m,rr_ratio=self.rr_ratio)
+                fvg_signals = self.detect_fvg_liquidity_shifts_v2(self,df_5m=df,df_15m=df_15m,rr_ratio=self.rr_ratio)
                 for ts, direction,take_profit,stop_loss,entry in fvg_signals:
                     print("we have a signal !!!")
                     bias_direction,bias_reason,bias_time = self.daily_bias
@@ -1178,11 +1187,14 @@ class LiveTrader:
             latest_signal_to_consider = None
             now_utc = datetime.now(timezone.utc)
             for signal in reversed(all_signals): # Check newest first        
-                print(f"The signal time is {signal['time']}")   
-                print(f"The df at {df.index[-2]}")
+                # print(f"The signal time is {signal['time']}")   
+                # print(f"The df at {df.index[-1]}")
+                print("The signal is")
+                print(signal)
+                print(df.index[-1])
 
                 # Only consider signals from the latest candle or one before
-                if signal["time"] >= df.index[-2]: # Signal on last or second-to-last candle
+                if signal["time"] >= df.index[-1]: # Signal on last or second-to-last candle
                     print(f"The signal time is {signal['time']}")
                     latest_signal_to_consider = all_signals[len(all_signals)-1]
                     print(f"The latest candle to consider is {latest_signal_to_consider}")

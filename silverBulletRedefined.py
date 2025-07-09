@@ -13,16 +13,15 @@ class TradingSimulator:
         self.initial_account_balance = account_balance # Store initial balance
         self.account_balance = account_balance
         self.risk_per_trade = risk_per_trade
-        self.daily_bias = self._get_daily_bias(symbol=symbol)
         
         if not mt5.initialize():
             # Attempt to login if initialization failed (common in scripts)
             # Replace with your actual account details or ensure MT5 terminal is logged in
-            # account_info = mt5.account_info()
-            # if account_info is None or account_info.login == 0:
-            #     print("MT5 not logged into an account.")
-            #     # Example login (use environment variables or secure config for credentials)
-            #     # mt5.login(account=YOUR_ACCOUNT, password="YOUR_PASSWORD", server="YOUR_SERVER")
+            account_info = mt5.account_info()
+            if account_info is None or account_info.login == 0:
+                print("MT5 not logged into an account.")
+                # Example login (use environment variables or secure config for credentials)
+                mt5.login(account=52422426, password="#Toothless31#", server="ICMarketsKE-Demo")
             if not mt5.initialize(): # Check again
                 error_message = f"MetaTrader5 initialize() failed with error: {mt5.last_error()}"
                 mt5.shutdown()
@@ -36,6 +35,7 @@ class TradingSimulator:
             raise ValueError(error_message)
             
         self.df = self._get_historical_data()
+        self.df_min = self._get_historical_data_m1(mt5.TIMEFRAME_M1)
         self.current_trade_id = 0
 
 
@@ -159,7 +159,6 @@ class TradingSimulator:
         start_date = datetime.now(timezone.utc) - timedelta(days=self.days_back)
         end_date = datetime.now(timezone.utc)
 
-        print(f"The start date {start_date} the end date  {end_date}")
         # Fetch recent bars
         rates = mt5.copy_rates_range(self.symbol, self.timeframe, start_date, end_date)
         if rates is None or len(rates) == 0:
@@ -185,6 +184,27 @@ class TradingSimulator:
         df = df.drop(columns=['hour'])
 
         print(f"Fetched {len(df)} rates for {self.symbol}.")
+        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+        df.set_index('time', inplace=True)
+
+        return df
+
+    def _get_data_using_range(self, timeframe: int,days_passed:int) -> pd.DataFrame:
+        """
+        Fetches historical data from MetaTrader 5 and filters it to New York time intervals.
+        Time intervals: 2–3 AM, 10–11 AM, 2–3 PM (New York time, DST-aware).
+
+        """
+        start_date = datetime.now(timezone.utc) - timedelta(days=days_passed)
+        end_date = datetime.now(timezone.utc)
+
+        # Fetch recent bars
+        rates = mt5.copy_rates_range(self.symbol, timeframe, start_date, end_date)
+        if rates is None or len(rates) == 0:
+            raise Exception("No data returned for symbol: " + self.symbol)
+
+        # Convert to DataFrame
+        df = pd.DataFrame(rates)
         df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
         df.set_index('time', inplace=True)
 
@@ -327,7 +347,7 @@ class TradingSimulator:
         return signals
     
     @staticmethod
-    def detect_fvg_liquidity_shifts_v2(
+    def detect_fvg_liquidity_shifts_v2(self,
         df_5m: pd.DataFrame,
         df_15m: pd.DataFrame,
         group_size: int = 12,
@@ -379,8 +399,10 @@ class TradingSimulator:
 
                 if (candle['high'] > prev_high and candle['close'] < candle['open']):
                     sweep_signals.append((idx, "bearish_sweep", prev_high))
+                    print(f"we have sweeps of type bearish at {idx}")
                 elif (candle['low'] < prev_low and candle['close'] > candle['open']):
                     sweep_signals.append((idx, "bullish_sweep", prev_low))
+                    print(f"we have sweeps of type bullish at {idx}")
 
         # Look for MSS + FVG in 5m after sweep
         for sweep_time, sweep_type, sweep_level in sweep_signals:
@@ -400,31 +422,40 @@ class TradingSimulator:
                     f3 = post_sweep_df.iloc[i + j + 2]
                     idx = f3.name
                     atr_margin = atr.loc[idx] if idx in atr.index else atr.iloc[-1]
+                    symbol_info = mt5.symbol_info(self.symbol)
+                    point = symbol_info.point  # 0.01
+                    sl_offset = 3.0  # 3 index points
 
                     if sweep_type == "bearish_sweep":
                         if (
                             f3['high'] < f2['high'] and
                             f3['close'] < f2['close'] and
-                            f3['low'] > (f1['high'] + fvg_buffer) and
+                            #f3['low'] > (f1['high'] + fvg_buffer) and
                             f3['close'] < f3['open']
                         ):
                             entry = (f1['high'] + f3['low']) / 2
-                            sl = entry + atr_margin
-                            tp = entry - (sl - entry) * rr_ratio
-                            signals.append((idx, "bearish", round(tp, 5), round(sl, 5), round(entry, 5)))
+                            
+
+                            sl = round(entry + sl_offset, 2)
+                            tp = round(entry - sl_offset * rr_ratio, 2)
+
+                            info = mt5.symbol_info(self.symbol)  # or whatever your symbol name is
+
+                            signals.append((idx, "bearish", tp,sl, round(entry, 2)))
                             break  # Avoid multiple signals per sweep
 
                     elif sweep_type == "bullish_sweep":
                         if (
                             f3['low'] > f2['low'] and
                             f3['close'] > f2['close'] and
-                            f3['high'] < (f1['low'] - fvg_buffer) and
+                            #f3['high'] < (f1['low'] - fvg_buffer) and
                             f3['close'] > f3['open']
                         ):
                             entry = (f1['low'] + f3['high']) / 2
-                            sl = entry - atr_margin
-                            tp = entry + (entry - sl) * rr_ratio
-                            signals.append((idx, "bullish", round(tp, 5), round(sl, 5), round(entry, 5)))
+                            sl = round(entry - sl_offset, 2)
+                            tp = round(entry + sl_offset * rr_ratio, 2)
+                            
+                            signals.append((idx, "bullish", tp, sl, round(entry, 2)))
                             break  # Avoid multiple signals per sweep
 
         return signals
@@ -1074,7 +1105,7 @@ class TradingSimulator:
         if use_fvg:
             df_5M =  self._get_historical_data_w_tf(mt5.TIMEFRAME_M5)
             df_15M =  self._get_historical_data_w_tf(mt5.TIMEFRAME_M15)
-            fvg_signals = self.detect_fvg_liquidity_shifts_v2(df_5m=df_5M,df_15m=df_15M,group_size=12,rr_ratio=rr_ratio)
+            fvg_signals = self.detect_fvg_liquidity_shifts_v2(self,df_5m=df_5M,df_15m=df_15M,group_size=12,rr_ratio=rr_ratio)
             trades += self._process_signals(fvg_signals, "FVG", rr_ratio, sl_points_fixed, enable_compounding)
             
         if use_sweeps:
@@ -1089,9 +1120,9 @@ class TradingSimulator:
 
         # trades_df.to_csv(f"trades_{self.symbol}_{self.timeframe_to_string(self.timeframe)}.csv")
         return trades_df
+    
 
     def _get_historical_data(self) -> pd.DataFrame:
-        """Fetch historical data from MT5."""
         start_date = datetime.now(timezone.utc) - timedelta(days=self.days_back)
         end_date = datetime.now(timezone.utc)
 
@@ -1103,16 +1134,55 @@ class TradingSimulator:
 
         rates = mt5.copy_rates_range(self.symbol, self.timeframe, start_date, end_date)
         if rates is None or len(rates) == 0:
-            error_message = f"Failed to fetch historical data for {self.symbol}. Error: {mt5.last_error()}, Rates count: {len(rates) if rates is not None else 'None'}"
-            # mt5.shutdown() # Keep MT5 running for other simulations
-            raise ValueError(error_message)
-            
+            raise ValueError(f"Failed to fetch historical data. Error: {mt5.last_error()}")
+
         df = pd.DataFrame(rates)
-        print(f"Fetched {len(df)} rates for {self.symbol}.")
         df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
         df.set_index('time', inplace=True)
+
+        # Initialize bias columns
+        df['daily_bias'] = None
+        df['bias_reason'] = None
+        df['bias_timestamp'] = None
+
+        # Loop per day
+        grouped = df.groupby(df.index.date)
+        for day, group in grouped:
+            day_dt = datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc)
+            bias, reasons, timestamp = self._get_daily_bias(window_size=30, as_of_date=day_dt)
+
+            df.loc[group.index, 'daily_bias'] = bias
+            df.loc[group.index, 'bias_reason'] = "; ".join(str(r) for r in reasons)
+            df.loc[group.index, 'bias_timestamp'] = timestamp
+
         return df
+
+
     
+    def _get_historical_data_m1(self,timeframe) -> pd.DataFrame:
+        start_date = datetime.now(timezone.utc) - timedelta(days=self.days_back)
+        end_date = datetime.now(timezone.utc)
+
+        print("----------------------------")
+        print(f"Fetching data for: {self.symbol}")
+        print(f"Timeframe: {self.timeframe_to_string(timeframe)}")
+        print(f"Start date: {start_date.strftime('%Y-%m-%d %H:%M')}")
+        print(f"End date: {end_date.strftime('%Y-%m-%d %H:%M')}")
+
+        rates = mt5.copy_rates_range(self.symbol, self.timeframe, start_date, end_date)
+        if rates is None or len(rates) == 0:
+            raise ValueError(f"Failed to fetch historical data. Error: {mt5.last_error()}")
+
+        df = pd.DataFrame(rates)
+        df['time'] = pd.to_datetime(df['time'], unit='s', utc=True)
+        df.set_index('time', inplace=True)
+
+
+        df.to_csv(f"minute_data{self.symbol}.csv")
+        exit(0)
+        return df
+
+ 
     def _get_historical_data_w_tf(self,timeframe) -> pd.DataFrame:
         """Fetch historical data from MT5."""
         days_back = 230
@@ -1141,89 +1211,92 @@ class TradingSimulator:
         """
         Fetches historical data for a smaller timeframe within a given range.
         """
-        rates = mt5.copy_rates_range(self.symbol, sub_timeframe, start_time, end_time)
+        print(f"Fetching from {start_time} to {end_time}, sub_timeframe: {mt5.TIMEFRAME_M1}")
+        rates = mt5.copy_rates_range(self.symbol, mt5.TIMEFRAME_M1, start_time, end_time)
+        print(f"Number of candles fetched: {len(rates) if rates is not None else 'None'}")
         #rates = mt5.copy_rates_from_pos(self.symbol, self.timeframe, 1, 1000)
         if rates is None or len(rates) == 0:
             return pd.DataFrame()
 
         df = pd.DataFrame(rates)
+        print("df before indexing")
+        print(df)
         df['time'] = pd.to_datetime(df['time'], unit='s')
         df = df.set_index('time')
+        print("df after indexing")
+        print(df)
+        exit(0)
+
         return df[['open', 'high', 'low', 'close', 'tick_volume']]
-    
-    def _get_daily_bias(self,symbol: str) -> Dict[str, List]:
-        """
-        Determine daily bias using SMC principles:
-        - Draw on Liquidity (above highs or below lows)
-        - Imbalance (price seeking unfilled FVGs)
+   
+    def _get_daily_bias(self, window_size: int, as_of_date: datetime = None) -> Tuple[str, List[str], datetime]:
+            """
+            Determine daily bias as of a specific date using SMC principles.
+            """
+            if not mt5.initialize():
+                raise RuntimeError("Failed to initialize MetaTrader5")
+
+            # Limit D1 data up to `as_of_date`
+            df = self._get_data_using_range(mt5.TIMEFRAME_D1, days_passed=330)
+            df = df[df.index <= as_of_date] if as_of_date else df
+            #df = df[-100:]  # last 100 days before that date
+
+            current_close = df['close'].iloc[-1]
+            current_high = df['high'].iloc[-1]
+            current_low = df['low'].iloc[-1]
+
+            # --- DRAW ON LIQUIDITY LOGIC ---
+            max_high = df['high'].rolling(window=window_size).max().iloc[-1]
+            min_low = df['low'].rolling(window=window_size).min().iloc[-1]
+
+            seeking_buy_stops = current_close < max_high and (max_high - current_close) / current_close > 0.01
+            seeking_sell_stops = current_close > min_low and (current_close - min_low) / current_close > 0.01
+
+            liquidity_bias = None
+            if seeking_buy_stops:
+                liquidity_bias = "bullish"
+                liquidity_reason = f"Draw on liquidity above 30-day high at {round(max_high, 2)}"
+            elif seeking_sell_stops:
+                liquidity_bias = "bearish"
+                liquidity_reason = f"Draw on liquidity below 30-day low at {round(min_low, 2)}"
+            else:
+                liquidity_bias = "neutral"
+                liquidity_reason = "No clear liquidity draw observed"
+
+            # --- FAIR VALUE GAP (FVG) LOGIC ---
+            fvg_bias = None
+            fvg_reason = "No daily FVG detected"
+            for i in range(len(df) - 2):
+                c1, c2, c3 = df.iloc[i], df.iloc[i + 1], df.iloc[i + 2]
+                if c3['low'] > c1['high']:  # Bearish imbalance (gap down)
+                    if current_close < c1['high']:
+                        fvg_bias = "bullish"
+                        fvg_reason = f"Price seeking up to fill FVG from {c1.name.date()}"
+                elif c3['high'] < c1['low']:  # Bullish imbalance (gap up)
+                    if current_close > c1['low']:
+                        fvg_bias = "bearish"
+                        fvg_reason = f"Price seeking down to fill FVG from {c1.name.date()}"
+
+            # --- RESOLUTION ---
+            final_bias = "neutral"
+            reasons = []
+
+            if liquidity_bias == fvg_bias and liquidity_bias != "neutral": 
+                final_bias = liquidity_bias
+                reasons = [max_high if final_bias == "bullish" else min_low, fvg_reason, liquidity_reason]
+            # elif liquidity_bias != "neutral":
+            #    final_bias = liquidity_bias
+            #    reasons = [max_high if final_bias == "bullish" else min_low, liquidity_reason]
+            # elif fvg_bias != "neutral":
+            #    final_bias = fvg_bias
+            #    reasons = [fvg_reason]
+
+            return (final_bias, reasons,datetime.now(timezone.utc))
         
-        Returns:
-            Dict[bias: List of [levels and final reason]]
-        """
-        if not mt5.initialize():
-            raise RuntimeError("Failed to initialize MetaTrader5")
+    def _get_timeframe_const_from_int(timeframe_int: int):
+        if timeframe_int == 1:
+            return mt5.TIMEFRAME_M1
 
-        now = datetime.utcnow()
-        start = now - timedelta(days=120)  # Buffer to ensure full 100 D1 candles
-
-        # Get D1 data
-        df = self._get_historical_data_w_tf(mt5.TIMEFRAME_D1)
-        df = df[-100:]  # Use last 100 candles
-
-        current_close = df['close'].iloc[-1]
-        current_high = df['high'].iloc[-1]
-        current_low = df['low'].iloc[-1]
-
-        # --- DRAW ON LIQUIDITY LOGIC ---
-        max_high = df['high'].rolling(window=30).max().iloc[-1]
-        min_low = df['low'].rolling(window=30).min().iloc[-1]
-
-        seeking_buy_stops = current_close < max_high and (max_high - current_close) / current_close > 0.01
-        seeking_sell_stops = current_close > min_low and (current_close - min_low) / current_close > 0.01
-
-        liquidity_bias = None
-        if seeking_buy_stops:
-            liquidity_bias = "bullish"
-            liquidity_reason = f"Draw on liquidity above 30-day high at {round(max_high, 2)}"
-        elif seeking_sell_stops:
-            liquidity_bias = "bearish"
-            liquidity_reason = f"Draw on liquidity below 30-day low at {round(min_low, 2)}"
-        else:
-            liquidity_bias = "neutral"
-            liquidity_reason = "No clear liquidity draw observed"
-
-        # --- FAIR VALUE GAP (FVG) LOGIC ---
-        fvg_bias = None
-        fvg_reason = "No daily FVG detected"
-        for i in range(len(df) - 2):
-            c1, c2, c3 = df.iloc[i], df.iloc[i + 1], df.iloc[i + 2]
-            if c3['low'] > c1['high']:  # Bearish imbalance (gap down)
-                if current_close < c1['high']:
-                    fvg_bias = "bullish"
-                    fvg_reason = f"Price seeking up to fill FVG from {c1.name.date()}"
-            elif c3['high'] < c1['low']:  # Bullish imbalance (gap up)
-                if current_close > c1['low']:
-                    fvg_bias = "bearish"
-                    fvg_reason = f"Price seeking down to fill FVG from {c1.name.date()}"
-
-        # --- RESOLUTION ---
-        final_bias = "neutral"
-        reasons = []
-
-        if liquidity_bias == fvg_bias and liquidity_bias != "neutral": 
-            final_bias = liquidity_bias
-            reasons = [max_high if final_bias == "bullish" else min_low, fvg_reason, liquidity_reason]
-        #elif liquidity_bias != "neutral":
-        #    final_bias = liquidity_bias
-        #    reasons = [max_high if final_bias == "bullish" else min_low, liquidity_reason]
-        #elif fvg_bias != "neutral":
-        #    final_bias = fvg_bias
-        #    reasons = [fvg_reason]
-
-        mt5.shutdown()
-
-        return (final_bias, reasons)
-    
     def _process_signals(self, signals: List[Tuple[pd.Timestamp, str]], signal_type_prefix: str, rr_ratio: float, sl_points_fixed: int, enable_compounding: bool) -> List[Dict]:
         """Process trading signals and simulate trades with lot size calculation."""
         processed_trades = []
@@ -1231,8 +1304,6 @@ class TradingSimulator:
         if self.symbol_info is None:
             print("Cannot process signals: symbol_info is not available.")
             return processed_trades
-        
-        bias_direction,bias_reason = self.daily_bias
             
         value_per_point_per_lot = (self.symbol_info.trade_tick_value / self.symbol_info.trade_tick_size) * self.symbol_info.point if self.symbol_info.trade_tick_size > 0 else 0
 
@@ -1241,16 +1312,18 @@ class TradingSimulator:
             #    continue
             
             # only take trades offered the direction of our daily bias
+            signal_index = self.df.index.get_loc(signal_time)
+
+            bias_direction = self.df.iloc[signal_index]["daily_bias"]
             
-            if bias_direction==signal_details:
+            if bias_direction!=signal_details:
                 print(f"The daily bias was {bias_direction}")
                 print(f"The signal direction was {signal_details}")
-                exit(0)
                 continue
                 
             entry_idx = self.df.index.get_loc(signal_time)
-            if entry_idx + 3 >= len(self.df): # Need at least 3 candles for entry fill check 
-                continue
+            # if entry_idx + 3 >= len(self.df): # Need at least 3 candles for entry fill check 
+            #     continue
             
             entry_candle = self.df.iloc[entry_idx]
             #entry_price = entry_candle['close'] # Entry at close of signal candle
@@ -1302,6 +1375,7 @@ class TradingSimulator:
             filled = False
             actual_entry_price = entry_price # Assume entry at signal candle close initially
             #entry_fill_time = signal_time - timedelta(hours=4)
+            
             entry_fill_time = signal_time
             #entry_fill_time = breaker_time
 
@@ -1312,7 +1386,7 @@ class TradingSimulator:
                 filled = True # Filled on the signal candle itself
 
             if not filled:
-                future_candles_for_fill = self.df.iloc[entry_idx + 1 : entry_idx + 1 + 30] # Look 3 candles ahead for fill
+                future_candles_for_fill = self.df.iloc[entry_idx + 1 : entry_idx + 1 + 6] # Look 3 candles ahead for fill
                 for k in range(len(future_candles_for_fill)):
                     future_candle = future_candles_for_fill.iloc[k]
                     if signal_direction == "bullish":
@@ -1338,15 +1412,22 @@ class TradingSimulator:
                 
                 # --- SIMPLIFIED: Only win/loss (TP or SL), no timeouts or early exits ---
                 start_tracking_idx = self.df.index.get_loc(entry_fill_time) + 1
-                monitoring_window_end_idx = min(start_tracking_idx + 12, len(self.df))
+                monitoring_window_end_idx = min(start_tracking_idx + 48, len(self.df))
 
                 timeout_start_time = self.df.index[start_tracking_idx]
                 #timeout_end_time = self.df.index[len(self.df) - 1] + pd.Timedelta(self.timeframe, unit='s')
-                timeout_end_time = self.df.index[len(self.df) - 1]
+                # timeout_end_time = self.df.index[len(self.df) - 1]
+                timeout_end_time = self.df.index[monitoring_window_end_idx -1]
+                print(f"The timeout start time is {timeout_start_time}")
+                print(f"The timeout start time is {timeout_end_time}")
+                
 
                 minute_data = self._get_sub_timeframe_data(timeout_start_time, timeout_end_time, mt5.TIMEFRAME_M1)
                 high = int(0)
                 low = int(0)
+
+                print(minute_data)
+                exit(0)
 
                 for _, m1_candle in minute_data.iterrows():
                     m1_high, m1_low = m1_candle['high'], m1_candle['low']
@@ -1387,6 +1468,9 @@ class TradingSimulator:
                             exit_time = m1_candle.name
                             break
 
+                print(f"the exit time is {exit_time}")
+                exit(0)
+
 
                 # Continue with PnL calculation and trade data logging as before
                 value_per_point_per_lot = (self.symbol_info.trade_tick_value / self.symbol_info.trade_tick_size) \
@@ -1404,6 +1488,7 @@ class TradingSimulator:
                     "exit_time": exit_time,
                     "type": f"{signal_type_prefix}_{signal_details}",
                     "position": position_type,
+                    "bias_direction": bias_direction,
                     "entry": actual_entry_price,
                     "sl": sl,
                     "tp": tp,
@@ -1584,7 +1669,7 @@ if __name__ == "__main__":
             sim = TradingSimulator(
                 symbol=sym, 
                 timeframe=tf_val, 
-                days_back=230 ,             # How many days of data
+                days_back=300 ,             # How many days of data
                 account_balance=10000,    # Starting balance
                 risk_per_trade=0.01        # Risk 1% per trade
             )
